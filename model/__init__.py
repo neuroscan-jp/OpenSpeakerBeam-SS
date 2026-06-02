@@ -146,15 +146,16 @@ class Separator(nn.Module):
         self.layer_norm_in = nn.LayerNorm(channels)
         self.in_conv1x1 = nn.Conv1d(channels, out_channels, kernel_size=1)
 
-        # 乗算条件付け: 192 → 256 (スケールのみ、v3 baseline)
+        # FiLM 条件付け: 192 → 512 (スケール 256 + シフト 256)
+        # 乗算のみ(v3)と異なり加算項があるため、干渉パターンを積極的にキャンセルできる
         self.spk_proj = nn.Sequential(
             nn.Linear(emb_dim, 256),
             nn.ReLU(),
             nn.Dropout(p=dropout),
-            nn.Linear(256, out_channels),
+            nn.Linear(256, 2 * out_channels),  # 512: scale 256 + shift 256
         )
 
-        # 第1ステージ: Conv1DBlock + S4DBlock + 乗算条件付け + Dropout
+        # 第1ステージ: Conv1DBlock + S4DBlock + FiLM 条件付け + Dropout
         self.blocks1 = nn.ModuleList()
         self.adapt1 = nn.ModuleList()
         self.drop1 = nn.ModuleList()
@@ -173,11 +174,11 @@ class Separator(nn.Module):
                 S4DBlock(d_model=out_channels),
             ]))
             self.adapt1.append(
-                MulAddAdaptLayer(indim=out_channels, enrolldim=out_channels, ninputs=1, do_addition=False)
+                MulAddAdaptLayer(indim=out_channels, enrolldim=2 * out_channels, ninputs=1, do_addition=True)
             )
             self.drop1.append(nn.Dropout(p=dropout))
 
-        # 第2ステージ: Conv1DBlock + S4DBlock + 乗算条件付け + Dropout
+        # 第2ステージ: Conv1DBlock + S4DBlock + FiLM 条件付け + Dropout
         self.blocks2 = nn.ModuleList()
         self.adapt2 = nn.ModuleList()
         self.drop2 = nn.ModuleList()
@@ -196,7 +197,7 @@ class Separator(nn.Module):
                 S4DBlock(d_model=out_channels),
             ]))
             self.adapt2.append(
-                MulAddAdaptLayer(indim=out_channels, enrolldim=out_channels, ninputs=1, do_addition=False)
+                MulAddAdaptLayer(indim=out_channels, enrolldim=2 * out_channels, ninputs=1, do_addition=True)
             )
             self.drop2.append(nn.Dropout(p=dropout))
 

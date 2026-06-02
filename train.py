@@ -163,6 +163,49 @@ def spectral_loss(s, s_hat, n_fft=512, hop_length=128, eps=1e-8):
     loss = torch.mean(torch.abs(torch.log(S.abs() + eps) - torch.log(S_hat.abs() + eps)))
     return loss
 
+
+def sdr_loss(s, s_hat, eps=1e-8):
+    """
+    SDR (Signal-to-Distortion Ratio) 損失。
+
+    SI-SNR と異なりスケール不変でないため、出力レベルがターゲットと
+    ずれる場合もペナルティを与える。残留干渉を直接最小化する効果。
+
+    Args:
+        s (Tensor): 正解音声 (B, T)
+        s_hat (Tensor): 推定音声 (B, T)
+    Returns:
+        loss (Tensor): 負の SDR の平均 [dB]
+    """
+    s = s - s.mean(dim=-1, keepdim=True)
+    s_hat = s_hat - s_hat.mean(dim=-1, keepdim=True)
+    target_energy = (s ** 2).sum(dim=-1)
+    distortion = s_hat - s
+    distortion_energy = (distortion ** 2).sum(dim=-1)
+    sdr = 10 * torch.log10(target_energy / (distortion_energy + eps) + eps)
+    return -sdr.mean()
+
+
+def interference_suppression_loss(s, s_hat, eps=1e-8):
+    """
+    残留干渉直接ペナルティ損失。
+
+    出力とターゲットの差（= 残留干渉）をターゲットのピークで正規化して最小化。
+    SI-SNR ・ SDR が対数スケールの頭打ちで感度が下がる高 SNR 域でも
+    線形スケールで干渉を押し込み続ける。
+
+    Args:
+        s (Tensor): 正解音声 (B, T)
+        s_hat (Tensor): 推定音声 (B, T)
+    Returns:
+        loss (Tensor): 残留干渉の正規化エネルギーの平均
+    """
+    residual = s_hat - s                                          # 残留干渉 (B, T)
+    # ターゲットのピーク絶対値で正規化（無音区間のゼロ除算を回避）
+    target_peak = s.abs().amax(dim=-1, keepdim=True).clamp(min=eps)  # (B, 1)
+    residual_norm = residual / target_peak
+    return residual_norm.pow(2).mean()
+
 def energy_consistency_loss(target, output, frame_len=1600, hop_len=800, threshold_db=-20, eps=1e-8):
     """
     フレームレベルのエネルギー一致損失。
@@ -311,13 +354,20 @@ def train_and_validate(args):
 
     # 事前学習済みモデルからfine-tune（--pretrained_model指定時）
     if args.pretrained_model and os.path.exists(args.pretrained_model):
-        state_dict = torch.load(args.pretrained_model, map_location=device)
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        pretrained_sd = torch.load(args.pretrained_model, map_location=device)
+        current_sd = model.state_dict()
+        loaded, skipped = [], []
+        for k, v in pretrained_sd.items():
+            if k in current_sd and current_sd[k].shape == v.shape:
+                current_sd[k] = v
+                loaded.append(k)
+            else:
+                skipped.append(k)
+        model.load_state_dict(current_sd)
         log(f"Loaded pretrained weights from {args.pretrained_model}")
-        if missing:
-            log(f"  New (randomly init) keys: {missing}")
-        if unexpected:
-            log(f"  Ignored keys: {unexpected}")
+        log(f"  Loaded: {len(loaded)} keys")
+        if skipped:
+            log(f"  Skipped (shape mismatch / new): {skipped}")
 
     # 音声埋め込みエンコーダー (ECAPA-TDNN)
     # torch._dynamo 初期化後にロードすることで speechbrain との衝突を回避
@@ -367,9 +417,16 @@ def train_and_validate(args):
             target = target.squeeze(1)
 
             loss_sisnr = si_snr_loss(target, output)
+            loss_sdr = sdr_loss(target, output)
             loss_spec = spectral_loss(target, output)
             loss_energy = energy_consistency_loss(target, output)
-            loss = loss_sisnr + 0.1 * loss_spec + 0.3 * loss_energy
+            loss_interference = interference_suppression_loss(target, output)
+            # SI-SNR: 基本的な分離品質を安定気く学習
+            # SDR:    スケール非不変、絶対的な残留干渉を直接ペナルティ
+            # Spec:   高周波音質補完
+            # Energy: 無音フレームでの干渉漏れ抱制
+            # Interference: 線形スケールで干渉残留を押し込む
+            loss = loss_sisnr + loss_sdr + 0.1 * loss_spec + 0.1 * loss_energy + 5.0 * loss_interference
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
@@ -380,7 +437,8 @@ def train_and_validate(args):
             if batch_idx % args.log_interval == 0:
                 log(f"[Train] Epoch {epoch+1}/{args.num_epochs}, "
                     f"Step {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f} "
-                    f"(SI-SNR={loss_sisnr.item():.4f}, Spec={loss_spec.item():.4f}, Energy={loss_energy.item():.4f})")
+                    f"(SI-SNR={loss_sisnr.item():.4f}, SDR={loss_sdr.item():.4f}, "
+                    f"Spec={loss_spec.item():.4f}, Energy={loss_energy.item():.4f}, Interf={loss_interference.item():.4f})")
 
         avg_train_loss = epoch_loss / len(train_loader)
 
