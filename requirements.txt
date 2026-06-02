@@ -4,3 +4,4 @@ asteroid
 resemblyzer
 thop
 silero-vad
+speechbrain

@@ -130,61 +130,36 @@ class S4DBlock(nn.Module):
 # =====================
 class Separator(nn.Module):
     """
-    SpeakerBeam-SS Style Separator.
+    SpeakerBeam-SS Style Separator — per-block speaker conditioning.
 
-    The overall flow is as follows:
-      1) Apply LayerNorm to the encoder output (input: (B, channels, T)).
-      2) Project the high-dimensional encoder output (e.g., 4096 channels) to a lower dimension (e.g., 256 channels)
-         via a 1x1 convolution.
-      3) Process the projected features with a series of (Conv1DBlock + S4DBlock) pairs (first stage).
-      4) Apply a multiplicative adaptation layer that fuses speaker embedding (d-vector) information.
-      5) Further process with another series of (Conv1DBlock + S4DBlock) pairs (second stage).
-      6) Project back to the original encoder channel dimension with a final 1x1 convolution.
-      7) Apply final LayerNorm and ReLU.
-      8) Combine the final output with the original encoder output via elementwise multiplication.
-
-    This design enables the network to extract target speaker features effectively.
+    改善点:
+      - スピーカー埋め込みを全 (Conv1DBlock + S4DBlock) ブロックで毎回適用
+      - ブロック数を増加 (num_blocks1=4, num_blocks2=2)
+      - スピーカー射影を MLP (Linear→ReLU→Linear) に強化
     """
 
-    def __init__(self, channels=4096, num_blocks1=3, num_blocks2=1):
+    def __init__(self, channels=4096, num_blocks1=4, num_blocks2=2, emb_dim=192, dropout=0.1):
         super().__init__()
-        # The internal processing dimension for the separator is 256
         out_channels = 256
-        # Intermediate hidden layer channels
         hidden_channels = 512
 
-        # Input LayerNorm (applied on (B, T, C))
         self.layer_norm_in = nn.LayerNorm(channels)
-
-        # 1x1 convolution to project from high-dim encoder output to out_channels (256)
         self.in_conv1x1 = nn.Conv1d(channels, out_channels, kernel_size=1)
 
-        # First stage: Repeated (Conv1DBlock + S4DBlock) blocks
+        # 乗算条件付け: 192 → 256 (スケールのみ、v3 baseline)
+        self.spk_proj = nn.Sequential(
+            nn.Linear(emb_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(256, out_channels),
+        )
+
+        # 第1ステージ: Conv1DBlock + S4DBlock + 乗算条件付け + Dropout
         self.blocks1 = nn.ModuleList()
+        self.adapt1 = nn.ModuleList()
+        self.drop1 = nn.ModuleList()
         for i in range(num_blocks1):
-            block = nn.ModuleList([
-                Conv1DBlock(
-                    in_chan=out_channels,  # 256 channels
-                    hid_chan=hidden_channels, # 512 channels
-                    skip_out_chan=0,  # no separate skip connection (using residual add instead)
-                    kernel_size=3,  # typical kernel size
-                    padding=(3 - 1) * (2 ** i),  # padding to maintain causal behavior, scaled by dilation
-                    dilation=2 ** i,
-                    norm_type="gLN",  # use global LayerNorm within the block
-                    causal=True  # causal convolution; lookahead blocks can be made non-causal as needed
-                ),
-                S4DBlock(d_model=out_channels)  # S4D block with d_model set to 256
-            ])
-            self.blocks1.append(block)
-
-        # Multiplicative adaptation layer for fusing speaker embedding information.
-        # (Note: for multiplicative adaptation, the enrollment embedding dimension should match out_channels.)
-        self.adapt = MulAddAdaptLayer(indim=out_channels, enrolldim=out_channels, ninputs=1, do_addition=False)
-
-        # Second stage: further processing with (Conv1DBlock + S4DBlock)
-        self.blocks2 = nn.ModuleList()
-        for i in range(num_blocks2):
-            block = nn.ModuleList([
+            self.blocks1.append(nn.ModuleList([
                 Conv1DBlock(
                     in_chan=out_channels,
                     hid_chan=hidden_channels,
@@ -193,64 +168,75 @@ class Separator(nn.Module):
                     padding=(3 - 1) * (2 ** i),
                     dilation=2 ** i,
                     norm_type="gLN",
-                    causal=True
+                    causal=True,
                 ),
-                S4DBlock(d_model=out_channels)
-            ])
-            self.blocks2.append(block)
+                S4DBlock(d_model=out_channels),
+            ]))
+            self.adapt1.append(
+                MulAddAdaptLayer(indim=out_channels, enrolldim=out_channels, ninputs=1, do_addition=False)
+            )
+            self.drop1.append(nn.Dropout(p=dropout))
 
-        # Final 1x1 conv to project back to the original encoder channel dimension (4096)
+        # 第2ステージ: Conv1DBlock + S4DBlock + 乗算条件付け + Dropout
+        self.blocks2 = nn.ModuleList()
+        self.adapt2 = nn.ModuleList()
+        self.drop2 = nn.ModuleList()
+        for i in range(num_blocks2):
+            self.blocks2.append(nn.ModuleList([
+                Conv1DBlock(
+                    in_chan=out_channels,
+                    hid_chan=hidden_channels,
+                    skip_out_chan=0,
+                    kernel_size=3,
+                    padding=(3 - 1) * (2 ** i),
+                    dilation=2 ** i,
+                    norm_type="gLN",
+                    causal=True,
+                ),
+                S4DBlock(d_model=out_channels),
+            ]))
+            self.adapt2.append(
+                MulAddAdaptLayer(indim=out_channels, enrolldim=out_channels, ninputs=1, do_addition=False)
+            )
+            self.drop2.append(nn.Dropout(p=dropout))
+
+        # Temporal Gate: フレームレベルで話者非存在区間を抑制する学習可能ゲート
+        # 初期バイアス=+3.0 → sigmoid ≈ 0.95 (fine-tune開始時はほぼ素通り)
+        # self.temporal_gate は v5 で試みたが全体的な抑制が強すぎたため除去
+
         self.out_conv1x1 = nn.Conv1d(out_channels, channels, kernel_size=1)
-
-        # Final LayerNorm (applied on (B, T, C))
         self.layer_norm_out = nn.LayerNorm(channels)
 
     def forward(self, x, spk_embedding):
-        """
-        Args:
-            x: Tensor of shape (batch, channels, time), where channels=4096 (encoder output)
-            spk_embedding: Speaker embedding tensor, assumed to have shape (batch, spk_embed_dim)
-                           Here, the embedding is expected to be 256-dimensional to match the internal dimension.
-        Returns:
-            x: Processed latent representation for the decoder, shape (batch, channels, time)
-        """
-        # Save original encoder output for later residual multiplication
         input_orig = x
 
-        # 1) Apply LayerNorm over channel dimension. Transpose to (B, T, C) for LN.
-        x = x.transpose(1, 2)  # (B, T, 4096)
+        x = x.transpose(1, 2)
         x = self.layer_norm_in(x)
-        x = x.transpose(1, 2)  # (B, 4096, T)
-
-        # 2) Project high-dim encoder output to lower dimension (256 channels)
+        x = x.transpose(1, 2)
         x = self.in_conv1x1(x)  # (B, 256, T)
 
-        # 3) Process through first stage blocks (Conv1DBlock + S4DBlock repeated)
-        for conv1d_block_1, s4d_block_1 in self.blocks1:
-            x = conv1d_block_1(x)  # Process with Conv1DBlock
-            x = s4d_block_1(x)  # Process with S4DBlock
+        # スピーカー埋め込みを射影 (B, 192) → (B, 256)
+        spk = self.spk_proj(spk_embedding)
 
-        # 4) Apply multiplicative adaptation using speaker embedding.
-        #    The embedding is broadcast along the time dimension.
-        x = self.adapt(x, spk_embedding)
+        # 第1ステージ: 各ブロック後にスピーカー条件付け + Dropout
+        for (conv_block, s4d_block), adapt, drop in zip(self.blocks1, self.adapt1, self.drop1):
+            x = conv_block(x)
+            x = s4d_block(x)
+            x = adapt(x, spk)  # ← 毎ブロックで適用
+            x = drop(x)
 
-        # 5) Process through second stage blocks (further refinement)
-        for conv1d_block_2, s4d_block_2 in self.blocks2:
-            x = conv1d_block_2(x)
-            x = s4d_block_2(x)
+        # 第2ステージ: 各ブロック後にスピーカー条件付け + Dropout
+        for (conv_block, s4d_block), adapt, drop in zip(self.blocks2, self.adapt2, self.drop2):
+            x = conv_block(x)
+            x = s4d_block(x)
+            x = adapt(x, spk)  # ← 毎ブロックで適用
+            x = drop(x)
 
-        # 6) Project back to the original channel dimension (4096) via 1x1 convolution.
         x = self.out_conv1x1(x)
-
-        # 7) Apply final LayerNorm (transpose for LN and transpose back)
-        x = x.transpose(1, 2)  # (B, T, 4096)
+        x = x.transpose(1, 2)
         x = self.layer_norm_out(x)
-        x = x.transpose(1, 2)  # (B, 4096, T)
-
-        # 8) Apply final ReLU non-linearity
+        x = x.transpose(1, 2)
         x = F.relu(x)
-
-        # 9) Combine with the original encoder output via elementwise multiplication (residual gating)
         x = x * input_orig
 
         return x
@@ -300,10 +286,10 @@ class SpeakerBeamSS(nn.Module):
     - The decoder converts the refined latent representation back to a time-domain waveform.
     """
 
-    def __init__(self):
+    def __init__(self, emb_dim=192):
         super().__init__()
         self.encoder = Encoder()  # Maps waveform to latent space (4096 channels)
-        self.separator = Separator()  # Processes latent representation (projects to 256, processes, then projects back)
+        self.separator = Separator(emb_dim=emb_dim)  # Processes latent representation (projects to 256, processes, then projects back)
         self.decoder = Decoder()  # Reconstructs waveform from latent representation
 
     def forward(self, mixture, enrollment):
@@ -329,7 +315,7 @@ class SpeakerBeamSS(nn.Module):
 # =====================
 if __name__ == "__main__":
     import torchaudio
-    from resemblyzer import VoiceEncoder
+    from tools import load_ecapa_model
     # 1つ目の音声をロード
     waveform1, sample_rate1 = torchaudio.load("../data/sample/20250306170609.wav")
     if sample_rate1 != 16000:
