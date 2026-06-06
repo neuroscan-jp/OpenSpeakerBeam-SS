@@ -119,8 +119,12 @@ def main():
         arrays.update(_export_s4d_block_stream(s4d_block, f"blocks.{idx}.s4d"))
         idx += 1
 
+    arrays.update(_tensor_dict(model.decoder.deconv, "decoder.deconv"))
+
     arrays["num_blocks"] = np.array([idx], dtype=np.int64)
     arrays["latent_channels"] = np.array([4096], dtype=np.int64)
+    arrays["dec_kernel"] = np.array([model.decoder.deconv.kernel_size[0]], dtype=np.int64)
+    arrays["dec_stride"] = np.array([model.decoder.deconv.stride[0]], dtype=np.int64)
     arrays["sep_channels"] = np.array([256], dtype=np.int64)
     arrays["hidden_channels"] = np.array([512], dtype=np.int64)
     arrays["embed_dim"] = np.array([192], dtype=np.int64)

@@ -238,7 +238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             push_stream_chunks(&mut enhanced, &mixture, &cfg, &args, &mut session)?;
         } else {
             let weights_path = resolve_path(&cwd, &args.separator_weights);
-            info!("incremental streaming (native S4D separator + encoder/decoder ONNX)");
+            info!("incremental streaming (native separator/decoder + batched encoder ONNX)");
             let mut session = IncrementalStreamingSession::from_files(
                 &enc_path,
                 &dec_path,

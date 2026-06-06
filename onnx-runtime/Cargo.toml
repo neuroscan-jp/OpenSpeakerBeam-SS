@@ -17,6 +17,7 @@ rust-version = "1.75"
 thiserror = "2"
 ndarray = "0.17"
 rayon = "1.10"
+matrixmultiply = "0.3"
 hound = "3.5"
 npy = "0.4"
 ndarray-npy = { version = "0.10", default-features = false, features = ["npz", "compressed_npz"] }

@@ -9,10 +9,15 @@ license.workspace = true
 thiserror.workspace = true
 ndarray.workspace = true
 rayon.workspace = true
+matrixmultiply.workspace = true
 speakerbeam-core.workspace = true
 ort.workspace = true
 ndarray-npy.workspace = true
 
 [[bench]]
 name = "separator_bench"
+harness = false
+
+[[bench]]
+name = "decoder_bench"
 harness = false

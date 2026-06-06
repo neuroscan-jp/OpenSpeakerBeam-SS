@@ -2,7 +2,7 @@
 Export split ONNX models for Rust streaming inference (cgLN separator).
 
 Outputs:
-  encoder_frame.onnx     : (1, 1, 320) → (1, 4096, 1)
+  encoder_frame.onnx     : (B, 1, 320) → (B, 4096, 1)  [dynamic B]
   decoder.onnx           : (1, 4096, L) → (1, 1, T_out)  [dynamic L]
   separator_cgln.onnx    : (1, 4096, Lpad) + (1, 192) → (1, 4096, Lpad)  [fixed Lpad]
   separator_chunk.onnx   : (1, 4096, Lchunk) + (1, 192) → (1, 4096, Lchunk)  [fixed Lchunk]
@@ -102,10 +102,14 @@ def main():
         with torch.no_grad():
             torch.onnx.export(
                 EncoderFrameOnnx(model.encoder).eval(),
-                torch.randn(1, 1, 320, device=device),
+                torch.randn(2, 1, 320, device=device),
                 str(enc_path),
                 input_names=["waveform"],
                 output_names=["latent"],
+                dynamic_axes={
+                    "waveform": {0: "batch"},
+                    "latent": {0: "batch"},
+                },
                 opset_version=args.opset,
                 dynamo=False,
             )

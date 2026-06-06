@@ -1029,6 +1029,7 @@ dependencies = [
 name = "speakerbeam-onnx"
 version = "0.1.0"
 dependencies = [
+ "matrixmultiply",
  "ndarray",
  "ndarray-npy",
  "ort",

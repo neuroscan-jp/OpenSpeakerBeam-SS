@@ -1,6 +1,8 @@
+use matrixmultiply::sgemm;
 use rayon::prelude::*;
 
 const EPS: f32 = 1e-8;
+const SGEMM_MIN_OPS: usize = 64 * 64;
 
 pub fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + ((0.7978845608 * (x + 0.044715 * x * x * x)).tanh()))
@@ -67,6 +69,36 @@ pub fn cum_ln(
     out
 }
 
+#[derive(Clone, Copy, Default, Debug)]
+pub struct CumLnState {
+    pub cum_sum: f32,
+    pub cum_pow: f32,
+}
+
+pub fn cum_ln_state_at(
+    x: &[f32],
+    channels: usize,
+    length: usize,
+    end_t: usize,
+) -> CumLnState {
+    let mut state = CumLnState::default();
+    if end_t == 0 {
+        return state;
+    }
+    for t in 0..end_t {
+        let mut frame_sum = 0.0f32;
+        let mut frame_pow = 0.0f32;
+        for c in 0..channels {
+            let v = x[c * length + t];
+            frame_sum += v;
+            frame_pow += v * v;
+        }
+        state.cum_sum += frame_sum;
+        state.cum_pow += frame_pow;
+    }
+    state
+}
+
 pub fn cum_ln_into(
     out: &mut [f32],
     x: &[f32],
@@ -75,9 +107,22 @@ pub fn cum_ln_into(
     channels: usize,
     length: usize,
 ) {
-    let mut cum_sum = 0.0f32;
-    let mut cum_pow = 0.0f32;
-    for t in 0..length {
+    cum_ln_into_from(out, x, gamma, beta, channels, length, 0, &mut CumLnState::default());
+}
+
+pub fn cum_ln_into_from(
+    out: &mut [f32],
+    x: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    channels: usize,
+    length: usize,
+    start_t: usize,
+    state: &mut CumLnState,
+) {
+    let mut cum_sum = state.cum_sum;
+    let mut cum_pow = state.cum_pow;
+    for t in start_t..length {
         let mut frame_sum = 0.0f32;
         let mut frame_pow = 0.0f32;
         for c in 0..channels {
@@ -96,6 +141,8 @@ pub fn cum_ln_into(
             out[idx] = gamma[c] * ((x[idx] - mean) * inv) + beta[c];
         }
     }
+    state.cum_sum = cum_sum;
+    state.cum_pow = cum_pow;
 }
 
 /// Conv1d: input (in_ch, in_len), weight (out_ch, in_ch/groups, k), bias optional.
@@ -148,14 +195,51 @@ pub fn conv1d_into(
     dilation: usize,
     groups: usize,
 ) {
+    conv1d_into_from(
+        y, x, weight, bias, in_ch, out_ch, in_len, out_len, k, stride, padding, dilation, groups, 0,
+    );
+}
+
+pub fn conv1d_into_from(
+    y: &mut [f32],
+    x: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    in_ch: usize,
+    out_ch: usize,
+    in_len: usize,
+    out_len: usize,
+    k: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    groups: usize,
+    out_start: usize,
+) {
     debug_assert_eq!(y.len(), out_ch * out_len);
     if k == 1 && stride == 1 && padding == 0 && dilation == 1 && groups == 1 {
-        conv1d_pointwise_into(y, x, weight, bias, in_ch, out_ch, in_len);
+        if out_start == 0 {
+            conv1d_pointwise_into(y, x, weight, bias, in_ch, out_ch, in_len);
+        } else {
+            y.par_chunks_mut(in_len)
+                .enumerate()
+                .for_each(|(oc, row)| {
+                    let w_row = oc * in_ch;
+                    let b = bias.map(|bias| bias[oc]).unwrap_or(0.0);
+                    for t in out_start..in_len {
+                        let mut acc = b;
+                        for ic in 0..in_ch {
+                            acc += weight[w_row + ic] * x[ic * in_len + t];
+                        }
+                        row[t] = acc;
+                    }
+                });
+        }
         return;
     }
     if groups == in_ch && groups == out_ch && stride == 1 {
-        conv1d_depthwise_into(
-            y, x, weight, bias, in_ch, in_len, out_len, k, padding, dilation,
+        conv1d_depthwise_into_from(
+            y, x, weight, bias, in_ch, in_len, out_len, k, padding, dilation, out_start,
         );
         return;
     }
@@ -189,6 +273,21 @@ fn conv1d_pointwise_into(
     debug_assert_eq!(weight.len(), out_ch * in_ch);
     debug_assert_eq!(y.len(), out_ch * in_len);
 
+    if in_ch * out_ch * in_len >= SGEMM_MIN_OPS
+        && conv1d_pointwise_sgemm(y, x, weight, in_ch, out_ch, in_len)
+    {
+        if let Some(bias) = bias {
+            y.par_chunks_mut(in_len)
+                .zip(bias.par_iter())
+                .for_each(|(row, &b)| {
+                    for v in row.iter_mut() {
+                        *v += b;
+                    }
+                });
+        }
+        return;
+    }
+
     y.par_chunks_mut(in_len)
         .enumerate()
         .for_each(|(oc, row)| {
@@ -205,7 +304,187 @@ fn conv1d_pointwise_into(
         });
 }
 
+/// Y = W @ X with row-major layouts: W(out_ch×in_ch), X(in_ch×in_len), Y(out_ch×in_len).
+fn conv1d_pointwise_sgemm(
+    y: &mut [f32],
+    x: &[f32],
+    weight: &[f32],
+    in_ch: usize,
+    out_ch: usize,
+    in_len: usize,
+) -> bool {
+    if weight.len() != out_ch * in_ch || x.len() != in_ch * in_len || y.len() != out_ch * in_len {
+        return false;
+    }
+    y.fill(0.0);
+    unsafe {
+        sgemm(
+            out_ch,
+            in_ch,
+            in_len,
+            1.0,
+            weight.as_ptr(),
+            in_ch as isize,
+            1,
+            x.as_ptr(),
+            in_len as isize,
+            1,
+            0.0,
+            y.as_mut_ptr(),
+            in_len as isize,
+            1,
+        );
+    }
+    true
+}
+
+#[inline]
+fn conv_transpose_sample_cf(
+    x: &[f32],
+    in_ch: usize,
+    in_len: usize,
+    weight: &[f32],
+    bias: f32,
+    kernel: usize,
+    stride: usize,
+    ot: usize,
+) -> f32 {
+    let it_lo = ot.saturating_sub(kernel - 1).div_ceil(stride);
+    let it_hi = (ot / stride).min(in_len.saturating_sub(1));
+    let mut acc = bias;
+    for it in it_lo..=it_hi {
+        let ki = ot - it * stride;
+        if ki >= kernel {
+            continue;
+        }
+        for ic in 0..in_ch {
+            acc += weight[ic * kernel + ki] * x[ic * in_len + it];
+        }
+    }
+    acc
+}
+
+#[inline]
+fn conv_transpose_sample_fm(
+    x: &[f32],
+    in_ch: usize,
+    in_len: usize,
+    weight: &[f32],
+    bias: f32,
+    kernel: usize,
+    stride: usize,
+    ot: usize,
+) -> f32 {
+    let it_lo = ot.saturating_sub(kernel - 1).div_ceil(stride);
+    let it_hi = (ot / stride).min(in_len.saturating_sub(1));
+    let mut acc = bias;
+    for it in it_lo..=it_hi {
+        let ki = ot - it * stride;
+        if ki >= kernel {
+            continue;
+        }
+        let x_base = it * in_ch;
+        for ic in 0..in_ch {
+            acc += weight[ic * kernel + ki] * x[x_base + ic];
+        }
+    }
+    acc
+}
+
+/// ConvTranspose1d decode: channel-major `x[in_ch * in_len]`, weight `[in_ch * kernel]`.
+pub fn conv_transpose1d_decode(
+    x: &[f32],
+    in_ch: usize,
+    in_len: usize,
+    weight: &[f32],
+    bias: f32,
+    kernel: usize,
+    stride: usize,
+) -> Vec<f32> {
+    let out_len = (in_len - 1) * stride + kernel;
+    let mut out = vec![0.0f32; out_len];
+    conv_transpose1d_decode_range(x, in_ch, in_len, weight, bias, kernel, stride, 0, &mut out);
+    out
+}
+
+pub fn conv_transpose1d_decode_range(
+    x: &[f32],
+    in_ch: usize,
+    in_len: usize,
+    weight: &[f32],
+    bias: f32,
+    kernel: usize,
+    stride: usize,
+    out_start: usize,
+    out: &mut [f32],
+) {
+    let out_len = out.len();
+    if out_start >= out_len {
+        return;
+    }
+    out[out_start..out_len].par_iter_mut().enumerate().for_each(|(i, slot)| {
+        *slot = conv_transpose_sample_cf(
+            x, in_ch, in_len, weight, bias, kernel, stride, out_start + i,
+        );
+    });
+}
+
+/// Frame-major latent: `x[in_len * in_ch]` with `x[frame * in_ch + ch]`.
+pub fn conv_transpose1d_decode_fm(
+    x: &[f32],
+    in_ch: usize,
+    in_len: usize,
+    weight: &[f32],
+    bias: f32,
+    kernel: usize,
+    stride: usize,
+) -> Vec<f32> {
+    let out_len = (in_len - 1) * stride + kernel;
+    let mut out = vec![0.0f32; out_len];
+    conv_transpose1d_decode_range_fm(x, in_ch, in_len, weight, bias, kernel, stride, 0, &mut out);
+    out
+}
+
+pub fn conv_transpose1d_decode_range_fm(
+    x: &[f32],
+    in_ch: usize,
+    in_len: usize,
+    weight: &[f32],
+    bias: f32,
+    kernel: usize,
+    stride: usize,
+    out_start: usize,
+    out: &mut [f32],
+) {
+    let out_len = out.len();
+    if out_start >= out_len {
+        return;
+    }
+    out[out_start..out_len].par_iter_mut().enumerate().for_each(|(i, slot)| {
+        *slot = conv_transpose_sample_fm(
+            x, in_ch, in_len, weight, bias, kernel, stride, out_start + i,
+        );
+    });
+}
+
 fn conv1d_depthwise_into(
+    y: &mut [f32],
+    x: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    channels: usize,
+    in_len: usize,
+    out_len: usize,
+    k: usize,
+    padding: usize,
+    dilation: usize,
+) {
+    conv1d_depthwise_into_from(
+        y, x, weight, bias, channels, in_len, out_len, k, padding, dilation, 0,
+    );
+}
+
+fn conv1d_depthwise_into_from(
     y: &mut [f32],
     x: &[f32],
     weight: &[f32],
@@ -216,6 +495,7 @@ fn conv1d_depthwise_into(
     k: usize,
     padding: usize,
     dilation: usize,
+    out_start: usize,
 ) {
     y.par_chunks_mut(out_len)
         .enumerate()
@@ -223,7 +503,7 @@ fn conv1d_depthwise_into(
             let b = bias.map(|bias| bias[c]).unwrap_or(0.0);
             let w_base = c * k;
             let x_row = c * in_len;
-            for ot in 0..out_len {
+            for ot in out_start..out_len {
                 let mut acc = b;
                 for ki in 0..k {
                     let t = ot + ki * dilation;
@@ -322,6 +602,29 @@ pub fn add_residual(a: &[f32], b: &[f32]) -> Vec<f32> {
 pub fn add_residual_into(out: &mut [f32], a: &[f32], b: &[f32]) {
     for (o, (&x, &y)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
         *o = x + y;
+    }
+}
+
+/// 1x1 conv with a single time step: `out[oc] = bias[oc] + sum_ic w[oc,ic]*x[ic]`.
+#[inline]
+pub fn pointwise_matvec_into(
+    out: &mut [f32],
+    x: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    in_ch: usize,
+    out_ch: usize,
+) {
+    debug_assert_eq!(x.len(), in_ch);
+    debug_assert_eq!(out.len(), out_ch);
+    debug_assert_eq!(weight.len(), out_ch * in_ch);
+    for oc in 0..out_ch {
+        let mut acc = bias.map(|b| b[oc]).unwrap_or(0.0);
+        let w_row = oc * in_ch;
+        for ic in 0..in_ch {
+            acc += weight[w_row + ic] * x[ic];
+        }
+        out[oc] = acc;
     }
 }
 

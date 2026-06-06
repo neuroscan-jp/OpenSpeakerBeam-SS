@@ -53,4 +53,45 @@ fn main() {
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
         println!("separator forward n_frames={n}: {ms:.2} ms");
     }
+
+    let n_total = 500usize;
+    let n_prev = n_total - 12;
+    let mut long_latent = Vec::with_capacity(n_total * 4096);
+    for f in 0..n_total {
+        let src = (f % n_frames) * 4096;
+        long_latent.extend_from_slice(&latent[src..src + 4096]);
+    }
+
+    sep.reset();
+    sep.set_embedding(emb.as_slice().unwrap()).unwrap();
+    let t0 = Instant::now();
+    for _ in 0..5 {
+        sep.reset();
+        sep.set_embedding(emb.as_slice().unwrap()).unwrap();
+        let _ = sep
+            .forward(&long_latent[..n_total * 4096], n_total, 0, emb.as_slice().unwrap())
+            .unwrap();
+    }
+    let full_ms = t0.elapsed().as_secs_f64() * 1000.0 / 5.0;
+    println!("separator full n_frames={n_total}: {full_ms:.2} ms");
+
+    sep.reset();
+    sep.set_embedding(emb.as_slice().unwrap()).unwrap();
+    let _ = sep
+        .forward(&long_latent[..n_prev * 4096], n_prev, 0, emb.as_slice().unwrap())
+        .unwrap();
+    let t0 = Instant::now();
+    let iters = 30;
+    for _ in 0..iters {
+        let _ = sep
+            .forward(
+                &long_latent[..n_total * 4096],
+                n_total,
+                n_prev,
+                emb.as_slice().unwrap(),
+            )
+            .unwrap();
+    }
+    let incr_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    println!("separator incremental n_prev={n_prev} -> {n_total}: {incr_ms:.2} ms");
 }

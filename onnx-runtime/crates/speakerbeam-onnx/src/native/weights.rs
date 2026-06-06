@@ -89,4 +89,35 @@ impl SeparatorWeights {
     pub fn get_usize(&self, key: &str) -> Result<usize, WeightsError> {
         Ok(self.get(key)?.first().copied().unwrap_or(0.0) as usize)
     }
+
+    pub fn decoder_weights(&self) -> Result<DecoderWeights, WeightsError> {
+        let raw = self.get("decoder.deconv.weight")?;
+        let in_ch = self.latent_channels;
+        let kernel = self.get_usize("dec_kernel").unwrap_or(320);
+        let stride = self.get_usize("dec_stride").unwrap_or(160);
+        if raw.len() != in_ch * kernel {
+            return Err(WeightsError::Npz(format!(
+                "decoder.deconv.weight len {} != in_ch*kernel {}",
+                raw.len(),
+                in_ch * kernel
+            )));
+        }
+        let bias = self.get("decoder.deconv.bias")?.first().copied().unwrap_or(0.0);
+        Ok(DecoderWeights {
+            weight: raw.to_vec(),
+            bias,
+            in_ch,
+            kernel,
+            stride,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct DecoderWeights {
+    pub weight: Vec<f32>,
+    pub bias: f32,
+    pub in_ch: usize,
+    pub kernel: usize,
+    pub stride: usize,
 }
