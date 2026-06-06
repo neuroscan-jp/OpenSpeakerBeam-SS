@@ -20,3 +20,8 @@ tmp/
 pretrained_models/
 *.pth
 
+# Rust ONNX runtime
+onnx-runtime/target/
+onnx-runtime/models/*.onnx
+onnx-runtime/models/*.onnx.data
+

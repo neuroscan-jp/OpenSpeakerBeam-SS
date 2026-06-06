@@ -4,6 +4,8 @@ import torchaudio
 import argparse
 import soundfile as sf
 from model import SpeakerBeamSS
+from model.streaming import OpusChunkAggregator, SpeakerBeamSSStream
+from model.incremental_streaming import IncrementalSpeakerBeamSSStream
 from tools import get_speaker_embeddings_batch, load_ecapa_model
 
 
@@ -372,8 +374,8 @@ def main():
                         help="Path to the enrollment audio file")
     parser.add_argument("--output", type=str, required=True,
                         help="Path to save the output (enhanced) wav file")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
-                        help="Directory containing the best_model.pth checkpoint")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/scratch_v2_lowsir",
+                        help="Directory containing the best_model.pth checkpoint (default: ep110 low-SIR)")
     parser.add_argument("--no_filter", action="store_true",
                         help="Skip speaker verification post-filter")
     parser.add_argument("--refine_filter", action="store_true",
@@ -384,6 +386,16 @@ def main():
                         help="Release smoothing length in hop frames (0=hard gate)")
     parser.add_argument("--sample_rate", type=int, default=16000,
                         help="Target sample rate (default: 16000)")
+    parser.add_argument("--stream", action="store_true",
+                        help="Streaming inference (任意長。cgLN + 増分 S4D)")
+    parser.add_argument("--stream-full-separator", action="store_true",
+                        help="毎チャンク separator 全履歴再実行（遅い、検証用）")
+    parser.add_argument("--stream_hop_ms", type=float, default=100.0,
+                        help="Direct push window in ms when --input-chunk-ms is unset")
+    parser.add_argument("--input-chunk-ms", type=float, default=None,
+                        help="Input chunk period in ms (e.g. Opus 60 ms)")
+    parser.add_argument("--process-every-chunks", type=int, default=2,
+                        help="Process every N input chunks (2-3 for Opus 60 ms)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -444,8 +456,41 @@ def main():
     speaker_embeddings = torch.stack(embeddings_list, dim=0).mean(dim=0)  # (B, emb_dim)
 
     # ----- 5. 推論実行 -----
-    with torch.no_grad():
-        enhanced = model(mixture_waveform, speaker_embeddings)
+    if args.stream:
+        stream_cls = (
+            SpeakerBeamSSStream if args.stream_full_separator else IncrementalSpeakerBeamSSStream
+        )
+        streamer = stream_cls(model)
+        streamer.set_embedding(speaker_embeddings)
+        streamer.reset(batch_size=mixture_waveform.shape[0], device=device)
+        parts = []
+        T = mixture_waveform.shape[-1]
+        with torch.no_grad():
+            if args.input_chunk_ms is not None:
+                agg = OpusChunkAggregator(
+                    args.sample_rate, args.input_chunk_ms, args.process_every_chunks
+                )
+                in_samples = agg.input_chunk_samples
+                for start in range(0, T, in_samples):
+                    chunk = mixture_waveform[..., start : start + in_samples]
+                    window = agg.push_chunk(chunk)
+                    if window is not None:
+                        parts.append(streamer.push(window))
+                tail_in = agg.flush(device=device, dtype=mixture_waveform.dtype)
+                if tail_in.shape[-1] > 0:
+                    parts.append(streamer.push(tail_in))
+            else:
+                hop = int(args.sample_rate * args.stream_hop_ms / 1000.0)
+                for start in range(0, T, hop):
+                    chunk = mixture_waveform[..., start : start + hop]
+                    parts.append(streamer.push(chunk))
+            tail = streamer.flush()
+            if tail.shape[-1] > 0:
+                parts.append(tail)
+        enhanced = torch.cat(parts, dim=-1)
+    else:
+        with torch.no_grad():
+            enhanced = model(mixture_waveform, speaker_embeddings)
     # enhanced の形状: (B, 1, T)
 
     # ----- 5.5. 話者照合フィルタ（スライディングウィンドウ）-----

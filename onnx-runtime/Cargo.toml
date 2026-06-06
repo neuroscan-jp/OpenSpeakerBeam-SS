@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/speakerbeam-core",
+    "crates/speakerbeam-onnx",
+    "crates/speakerbeam-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/your-org/OpenSpeakerBeam-SS"
+rust-version = "1.75"
+
+[workspace.dependencies]
+thiserror = "2"
+ndarray = "0.17"
+rayon = "1.10"
+hound = "3.5"
+npy = "0.4"
+ndarray-npy = { version = "0.10", default-features = false, features = ["npz", "compressed_npz"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+clap = { version = "4", features = ["derive"] }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-native-vendored"] }
+speakerbeam-core = { path = "crates/speakerbeam-core" }
+speakerbeam-onnx = { path = "crates/speakerbeam-onnx" }

@@ -1,0 +1,12 @@
+[package]
+name = "speakerbeam-core"
+description = "Audio I/O, embedding prep, and shared config for OpenSpeakerBeam-SS ONNX runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+ndarray.workspace = true
+hound.workspace = true
+ndarray-npy.workspace = true

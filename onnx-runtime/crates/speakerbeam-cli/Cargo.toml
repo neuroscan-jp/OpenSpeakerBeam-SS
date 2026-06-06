@@ -1,0 +1,17 @@
+[package]
+name = "speakerbeam-cli"
+description = "CLI for OpenSpeakerBeam-SS ONNX inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "speakerbeam-cli"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+speakerbeam-core.workspace = true
+speakerbeam-onnx.workspace = true

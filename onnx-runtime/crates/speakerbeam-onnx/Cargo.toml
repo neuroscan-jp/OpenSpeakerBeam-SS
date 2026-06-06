@@ -1,0 +1,18 @@
+[package]
+name = "speakerbeam-onnx"
+description = "ONNX Runtime session wrapper for SpeakerBeamSS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+ndarray.workspace = true
+rayon.workspace = true
+speakerbeam-core.workspace = true
+ort.workspace = true
+ndarray-npy.workspace = true
+
+[[bench]]
+name = "separator_bench"
+harness = false

@@ -17,7 +17,7 @@ The **network model implementation, training, and test dataset preparation are c
 - Conv-TasNet-based architecture with **S4D blocks** for efficient temporal modeling
 - **Multiplicative adaptation** with d-vector speaker embeddings
 - **1D convolutional blocks** for feature extraction
-- **ONNX Runtime support** for CPU acceleration (AVX2 / AVX-512)
+- **ONNX Runtime support** for CPU acceleration (AVX2 / AVX-512) — see [`onnx-runtime/`](onnx-runtime/) (Rust 推論ツリー)
 - **Designed for real-time inference** on mobile and server environments
 
 ## 🔧 Installation
