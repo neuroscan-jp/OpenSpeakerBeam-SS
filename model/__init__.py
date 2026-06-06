@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from asteroid.masknn.convolutional import Conv1DBlock  # Conv-TasNet style 1-D convolution block
-from model.s4d import S4D  # S4D layer implementation
+from model.s4d import S4D, S4DStream  # S4D layer implementation
 from model.adapt_layers import MulAddAdaptLayer  # Multiplicative adaptation (or FiLM) layer
 from tools import get_speaker_embeddings_batch
 
@@ -123,6 +123,103 @@ class S4DBlock(nn.Module):
         # Final residual addition
         B = A + a_
         return B
+
+
+class S4DBlockStream(nn.Module):
+    """
+    ストリーミング推論用 S4DBlock ラッパー.
+
+    学習済み :class:`S4DBlock` を受け取り、全演算をタイムステップごとに実行します。
+    S4D 以外の全演算（LayerNorm, GLU, 1x1 Conv）はポイントワイズのため
+    状態管理は S4D の複素隠れ状態 ``h`` のみで完結します。
+
+    Parameters
+    ----------
+    s4d_block : S4DBlock
+        学習済み S4DBlock モジュール。
+    """
+
+    def __init__(self, s4d_block: S4DBlock):
+        super().__init__()
+
+        self.ln_s4d      = s4d_block.ln_s4d
+        self.s4d_stream  = S4DStream(s4d_block.s4d)   # FFT → RNN モード変換
+        self.gelu1       = s4d_block.gelu1
+        self.linear1     = s4d_block.linear1           # Conv1d(H, H, kernel=1)
+
+        self.glu_conv    = s4d_block.glu_conv          # Conv1d(2H, 2H, kernel=1)
+        self.glu         = s4d_block.glu               # GLU(dim=1)
+
+        self.ln_ff2      = s4d_block.ln_ff2
+        self.ff2_linear1 = s4d_block.ff2_linear1       # Conv1d(H, H, kernel=1)
+        self.ff2_gelu    = s4d_block.ff2_gelu
+        self.ff2_linear2 = s4d_block.ff2_linear2       # Conv1d(H, H, kernel=1)
+
+    def initial_state(self, batch_size: int, device=None) -> torch.Tensor:
+        """S4D 隠れ状態のゼロ初期化. shape: (B, H, N/2, 2)"""
+        return self.s4d_stream.initial_state(batch_size, device)
+
+    def step(self, x_t: torch.Tensor, h: torch.Tensor):
+        """
+        1 タイムステップを処理する.
+
+        Parameters
+        ----------
+        x_t : Tensor, shape (B, H)
+            時刻 t の入力フィーチャ。
+        h : Tensor, shape (B, H, N/2, 2)
+            S4D の隠れ状態（実数ビュー）。
+
+        Returns
+        -------
+        out : Tensor, shape (B, H)
+        h_new : Tensor, shape (B, H, N/2, 2)
+        """
+        # --- Step 1: LN → S4D(RNN step) → GELU → 1x1 Conv ---
+        y = self.ln_s4d(x_t)                                       # (B, H)
+        y, h_new = self.s4d_stream.step(y, h)                      # (B, H)
+        y = self.gelu1(y)                                           # (B, H)
+        y = self.linear1(y.unsqueeze(-1)).squeeze(-1)               # (B, H)
+
+        # --- Step 2: GLU merge ---
+        cat_xy = torch.cat([x_t, y], dim=1)                        # (B, 2H)
+        z = self.glu_conv(cat_xy.unsqueeze(-1)).squeeze(-1)        # (B, 2H)
+        z = self.glu(z)                                            # (B, H)  [GLU(dim=1) on 2D]
+        A = x_t + z                                                # Skip connection
+
+        # --- Step 3: Feed-Forward (LN → Linear → GELU → Linear) ---
+        a_ = self.ln_ff2(A)                                        # (B, H)
+        a_ = self.ff2_linear1(a_.unsqueeze(-1)).squeeze(-1)        # (B, H)
+        a_ = self.ff2_gelu(a_)                                     # (B, H)
+        a_ = self.ff2_linear2(a_.unsqueeze(-1)).squeeze(-1)        # (B, H)
+        out = A + a_                                               # Skip connection
+
+        return out, h_new
+
+    def forward(self, x: torch.Tensor, h=None):
+        """
+        チャンク単位のストリーミング推論.
+
+        Parameters
+        ----------
+        x : Tensor, shape (B, H, L)
+        h : Tensor, shape (B, H, N/2, 2) or None
+
+        Returns
+        -------
+        y_out : Tensor, shape (B, H, L)
+        h_new : Tensor, shape (B, H, N/2, 2)
+        """
+        B, H, L = x.shape
+        if h is None:
+            h = self.initial_state(B, device=x.device)
+
+        outs = []
+        for t in range(L):
+            out_t, h = self.step(x[..., t], h)
+            outs.append(out_t)
+
+        return torch.stack(outs, dim=-1), h
 
 
 # =====================

@@ -117,6 +117,33 @@ def scale_to_snr(clean: np.ndarray, noise: np.ndarray, snr_db: float) -> np.ndar
     return noise * scaling_factor
 
 
+def sample_sir_db(
+    sir_min: float,
+    sir_max: float,
+    focus_min: float | None = None,
+    focus_max: float | None = None,
+    focus_prob: float = 0.0,
+) -> float:
+    """
+    SIR [dB] をサンプリングする。
+    focus_prob > 0 のとき、その確率で [focus_min, focus_max] を一様サンプリングし、
+    残りは重点帯外を帯域幅に比例して一様サンプリングする。
+    """
+    if focus_prob <= 0.0 or focus_min is None or focus_max is None or focus_min >= focus_max:
+        return random.uniform(sir_min, sir_max)
+
+    if random.random() < focus_prob:
+        return random.uniform(focus_min, focus_max)
+
+    low_w = max(0.0, focus_min - sir_min)
+    high_w = max(0.0, sir_max - focus_max)
+    if low_w + high_w <= 1e-8:
+        return random.uniform(focus_min, focus_max)
+    if random.random() < low_w / (low_w + high_w):
+        return random.uniform(sir_min, focus_min)
+    return random.uniform(focus_max, sir_max)
+
+
 def mix_signals(target: np.ndarray, interference: np.ndarray, noise: np.ndarray,
                 sir_db: float, snr_db: float) -> np.ndarray:
     """
@@ -256,9 +283,13 @@ def create_mixture_data_and_csv(args):
         interferer_seg = get_random_segment(interferer_waveform)
         # enrollment については、assemble_enrollment_audio で既に連結済みのテンソルを使用するので、固定長セグメント抽出は不要
 
-        # ランダムに SNR, SIR を設定
+        # ランダムに SNR, SIR を設定（SIR は focus 帯の重み付きサンプリング可）
         snr_db = random.uniform(*snr_range)
-        sir_db = random.uniform(*sir_range)
+        sir_db = sample_sir_db(
+            sir_range[0], sir_range[1],
+            args.sir_focus_min, args.sir_focus_max,
+            args.sir_focus_prob,
+        )
 
         # ノイズファイルからランダムに選んでセグメント抽出
         noise_file = random.choice(noise_files)
@@ -322,6 +353,12 @@ if __name__ == "__main__":
     parser.add_argument("--snr_max", type=float, default=25, help="Maximum SNR (dB)")
     parser.add_argument("--sir_min", type=float, default=-5, help="Minimum SIR (dB)")
     parser.add_argument("--sir_max", type=float, default=5, help="Maximum SIR (dB)")
+    parser.add_argument("--sir_focus_min", type=float, default=None,
+                        help="Lower bound of emphasized SIR band [dB] (optional)")
+    parser.add_argument("--sir_focus_max", type=float, default=None,
+                        help="Upper bound of emphasized SIR band [dB] (optional)")
+    parser.add_argument("--sir_focus_prob", type=float, default=0.0,
+                        help="Probability of sampling from the focus band (0=uniform)")
     args = parser.parse_args()
 
     create_mixture_data_and_csv(args)

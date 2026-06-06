@@ -131,3 +131,153 @@ class S4D(nn.Module):
         y = self.output_linear(y)
         if not self.transposed: y = y.transpose(-1, -2)
         return y, None # Return a dummy state to satisfy this repo's interface, but this can be modified
+
+
+class S4DStream(nn.Module):
+    """
+    ストリーミング推論用 S4D ラッパー (RNN モード).
+
+    学習済み S4D モジュールの FFT 畳み込みを以下の再帰式に変換します::
+
+        h_t = Ā · h_{t-1} + B̄ · u_t   (複素対角 SSM)
+        y_t = 2 · Re(C · h_t) + D · u_t
+
+    ZOH 離散化パラメータ::
+
+        Ā = exp(dt · A)
+        B̄ = (exp(dt · A) − 1) / A      (B=1 を吸収した形)
+
+    FFT 版と数学的に完全等価のため、学習済みパラメータをそのまま使用でき
+    **性能劣化ゼロ** でリアルタイム（チャンクごと）推論が可能です。
+
+    Parameters
+    ----------
+    s4d : S4D
+        学習済み S4D モジュール。
+    """
+
+    def __init__(self, s4d: S4D):
+        super().__init__()
+
+        self.h = s4d.h          # d_model
+        self.n = s4d.n          # d_state
+        self.transposed = s4d.transposed
+
+        kernel: S4DKernel = s4d.kernel
+
+        with torch.no_grad():
+            dt = torch.exp(kernel.log_dt)                                       # (H,)
+            C  = torch.view_as_complex(kernel.C.data.clone().contiguous())      # (H, N/2) complex
+            A  = -torch.exp(kernel.log_A_real) + 1j * kernel.A_imag            # (H, N/2) complex
+
+            dtA   = A * dt.unsqueeze(-1)                                        # (H, N/2)
+            A_bar = torch.exp(dtA)                                              # (H, N/2)
+            B_bar = (torch.exp(dtA) - 1.0) / A                                 # (H, N/2)
+
+        # 複素テンソルを実数ビュー (…, 2) でバッファ登録 → .to(device) に自動追従
+        self.register_buffer("_A_bar", torch.view_as_real(A_bar.contiguous()))  # (H, N/2, 2)
+        self.register_buffer("_B_bar", torch.view_as_real(B_bar.contiguous()))  # (H, N/2, 2)
+        self.register_buffer("_C",     torch.view_as_real(C.contiguous()))      # (H, N/2, 2)
+        self.register_buffer("_D",     s4d.D.data.clone())                      # (H,)
+
+        # 活性化・出力変換は元モジュールから参照（重み共有）
+        self.activation    = s4d.activation     # GELU
+        self.output_linear = s4d.output_linear  # Conv1d(H, 2H, kernel=1) + GLU
+
+    # ------------------------------------------------------------------
+    # 状態管理
+    # ------------------------------------------------------------------
+
+    def initial_state(self, batch_size: int, device=None) -> torch.Tensor:
+        """
+        ゼロ初期隠れ状態を返す.
+
+        Returns
+        -------
+        h : Tensor, shape (B, H, N/2, 2)
+            複素隠れ状態の実数ビュー（:func:`torch.view_as_real` 形式）。
+        """
+        dev = device if device is not None else self._A_bar.device
+        return torch.zeros(batch_size, self.h, self.n // 2, 2, device=dev)
+
+    # ------------------------------------------------------------------
+    # 単一タイムステップ推論
+    # ------------------------------------------------------------------
+
+    def step(self, u: torch.Tensor, h: torch.Tensor):
+        """
+        1 タイムステップを処理する.
+
+        Parameters
+        ----------
+        u : Tensor, shape (B, H)
+            時刻 t の入力フィーチャ。
+        h : Tensor, shape (B, H, N/2, 2)
+            前ステップの隠れ状態（:meth:`initial_state` または本メソッドの戻り値）。
+
+        Returns
+        -------
+        y : Tensor, shape (B, H)
+            出力（activation・output_linear を適用済み）。
+        h_new : Tensor, shape (B, H, N/2, 2)
+            更新後の隠れ状態（実数ビュー）。
+        """
+        A_bar_c = torch.view_as_complex(self._A_bar)           # (H, N/2)
+        B_bar_c = torch.view_as_complex(self._B_bar)           # (H, N/2)
+        C_c     = torch.view_as_complex(self._C)                # (H, N/2)
+        h_c     = torch.view_as_complex(h.contiguous())         # (B, H, N/2)
+
+        # h_t = Ā · h_{t-1} + B̄ · u_t
+        # u: (B, H) → unsqueeze(-1) で (B, H, 1) にブロードキャスト
+        h_new_c = A_bar_c * h_c + B_bar_c * u.unsqueeze(-1)    # (B, H, N/2)
+
+        # y_t = 2 · Re(C · h_t) + D · u_t
+        y = 2.0 * (C_c * h_new_c).real.sum(-1) + self._D * u   # (B, H)
+
+        # activation (GELU) → output_linear (pointwise Conv1d + GLU)
+        y = self.activation(y)                                   # (B, H)
+        y = self.output_linear(y.unsqueeze(-1)).squeeze(-1)      # (B, H)
+
+        return y, torch.view_as_real(h_new_c)
+
+    # ------------------------------------------------------------------
+    # チャンク推論（学習時の S4D.forward と同一シグネチャ）
+    # ------------------------------------------------------------------
+
+    def forward(self, u: torch.Tensor, h=None):
+        """
+        チャンク単位のストリーミング推論.
+
+        学習時の :class:`S4D` の ``forward`` と同じシグネチャなので
+        そのまま差し替えて使用できます。
+
+        Parameters
+        ----------
+        u : Tensor, shape (B, H, L)  [``transposed=True`` 時]
+              または  (B, L, H)       [``transposed=False`` 時]
+        h : Tensor, shape (B, H, N/2, 2) or None
+            引き継ぐ隠れ状態。``None`` の場合はゼロ初期化。
+
+        Returns
+        -------
+        y_out : Tensor, same shape as u
+        h_new : Tensor, shape (B, H, N/2, 2)
+        """
+        if not self.transposed:
+            u = u.transpose(-1, -2)   # → (B, H, L)
+
+        B, H, L = u.shape
+        if h is None:
+            h = self.initial_state(B, device=u.device)
+
+        ys = []
+        for t in range(L):
+            y_t, h = self.step(u[..., t], h)   # (B, H)
+            ys.append(y_t)
+
+        y_out = torch.stack(ys, dim=-1)          # (B, H, L)
+
+        if not self.transposed:
+            y_out = y_out.transpose(-1, -2)
+
+        return y_out, h

@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import hashlib
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ import soundfile as sf
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import pandas as pd
+from tqdm import tqdm
 from model import SpeakerBeamSS
 from tools import get_speaker_embedding, load_ecapa_model
 
@@ -35,53 +37,33 @@ def load_audio(path, target_sample_rate=16000):
 
 
 def collate_speech_batch(batch):
-    mixtures, enrollments, targets, enrollment_paths = zip(*batch)
+    mixtures, enrollment_paths, targets = zip(*batch)
 
     def _pad_waveforms(waveforms):
         padded = pad_sequence([waveform.squeeze(0) for waveform in waveforms], batch_first=True)
         return padded.unsqueeze(1)
 
-    enrollment_lengths = torch.tensor([waveform.shape[-1] for waveform in enrollments], dtype=torch.int64)
-
     return (
         _pad_waveforms(mixtures),
-        _pad_waveforms(enrollments),
         _pad_waveforms(targets),
-        enrollment_lengths,
         list(enrollment_paths),
     )
 
 
-def get_cached_speaker_embeddings(
-    speaker_encoder,
-    enrollment_batch,
-    enrollment_lengths,
-    enrollment_paths,
-    cache_dir,
-    device,
-):
-    os.makedirs(cache_dir, exist_ok=True)
+def get_cached_speaker_embeddings(enrollment_paths, cache_dir, device, expected_dim=192):
+    """キャッシュ済み埋め込みをロードして返す（事前計算済み前提）。"""
     embeddings = []
-
-    for index, enrollment_path in enumerate(enrollment_paths):
+    for enrollment_path in enrollment_paths:
         cache_key = hashlib.sha1(os.path.normpath(enrollment_path).encode("utf-8")).hexdigest()
         cache_path = os.path.join(cache_dir, f"{cache_key}.npy")
-
-        if os.path.exists(cache_path):
-            embedding = torch.from_numpy(np.load(cache_path))
-        else:
-            enrollment_length = int(enrollment_lengths[index].item())
-            waveform = enrollment_batch[index, :, :enrollment_length]
-            embedding_np = get_speaker_embedding(speaker_encoder, waveform)
-            np.save(cache_path, embedding_np)
-            embedding = torch.from_numpy(embedding_np)
-
-        embeddings.append(embedding.float())
-
+        if not os.path.exists(cache_path):
+            raise FileNotFoundError(f"Embedding cache not found: {cache_path}. Run precompute first.")
+        embedding = torch.from_numpy(np.load(cache_path)).float()
+        embeddings.append(embedding)
     return torch.stack(embeddings, dim=0).to(device)
 
 
-def precompute_all_embeddings(csv_files, cache_dir, speaker_encoder, device):
+def precompute_all_embeddings(csv_files, cache_dir, speaker_encoder, device, expected_dim=192):
     """全CSVのenrollment音声の埋め込みを事前計算してキャッシュに保存する。
     これにより学習ループ中にSpeechBrainを呼び出す必要がなくなる。"""
     os.makedirs(cache_dir, exist_ok=True)
@@ -95,25 +77,23 @@ def precompute_all_embeddings(csv_files, cache_dir, speaker_encoder, device):
     total = len(all_enrollment_paths)
     log(f"Pre-computing speaker embeddings for {total} unique enrollment files...")
 
-    done = 0
-    for enrollment_path in sorted(all_enrollment_paths):
-        cache_key = hashlib.sha1(os.path.normpath(enrollment_path).encode("utf-8")).hexdigest()
-        cache_path = os.path.join(cache_dir, f"{cache_key}.npy")
+    with tqdm(sorted(all_enrollment_paths), total=total, desc="Embeddings", unit="file", dynamic_ncols=True) as pbar:
+        for enrollment_path in pbar:
+            cache_key = hashlib.sha1(os.path.normpath(enrollment_path).encode("utf-8")).hexdigest()
+            cache_path = os.path.join(cache_dir, f"{cache_key}.npy")
 
-        if os.path.exists(cache_path):
-            done += 1
-            continue
+            # 既存キャッシュの次元チェック（不一致なら再計算して上書き）
+            if os.path.exists(cache_path):
+                cached = np.load(cache_path)
+                if cached.shape[-1] == expected_dim:
+                    continue
 
-        try:
-            waveform, _ = load_audio(enrollment_path)
-            embedding_np = get_speaker_embedding(speaker_encoder, waveform)
-            np.save(cache_path, embedding_np)
-        except Exception as e:
-            log(f"  Warning: Failed for {enrollment_path}: {e}")
-
-        done += 1
-        if done % 200 == 0 or done == total:
-            log(f"  [{done}/{total}] embeddings cached")
+            try:
+                waveform, _ = load_audio(enrollment_path)
+                embedding_np = get_speaker_embedding(speaker_encoder, waveform)
+                np.save(cache_path, embedding_np)
+            except Exception as e:
+                pbar.write(f"  Warning: Failed for {enrollment_path}: {e}")
 
     log("Pre-computation complete.\n")
 
@@ -186,25 +166,56 @@ def sdr_loss(s, s_hat, eps=1e-8):
     return -sdr.mean()
 
 
-def interference_suppression_loss(s, s_hat, eps=1e-8):
+def _voiced_mask(s, frame_len=1600, eps=1e-8):
+    """ターゲット有声区間のサンプルマスク (B, T)。"""
+    B, T = s.shape
+    if T < frame_len:
+        return torch.ones(B, T, device=s.device)
+    hop = frame_len // 2
+    s_frames = s.unfold(-1, frame_len, hop)
+    frame_energy = s_frames.pow(2).mean(-1)
+    peak_energy = frame_energy.amax(dim=-1, keepdim=True).clamp(min=eps)
+    voiced_frame_mask = (frame_energy >= peak_energy * 0.01).float()
+    voiced_mask = torch.zeros(B, T, device=s.device)
+    for i in range(voiced_frame_mask.shape[1]):
+        start = i * hop
+        end = min(start + frame_len, T)
+        voiced_mask[:, start:end] = torch.max(
+            voiced_mask[:, start:end],
+            voiced_frame_mask[:, i:i + 1].expand(-1, end - start),
+        )
+    return voiced_mask
+
+
+def interference_suppression_loss_per_sample(s, s_hat, eps=1e-8, frame_len=1600):
     """
-    残留干渉直接ペナルティ損失。
+    残留干渉直接ペナルティ（有声マスク付き）をサンプルごとに返す。
+
+    Returns:
+        Tensor: (B,) 各サンプルの正規化残留干渉エネルギー
+    """
+    residual = s_hat - s
+    target_peak = s.abs().amax(dim=-1, keepdim=True).clamp(min=eps)
+    residual_norm = residual / target_peak
+    voiced_mask = _voiced_mask(s, frame_len=frame_len, eps=eps)
+    residual_norm = residual_norm * voiced_mask
+    n_voiced = voiced_mask.sum(dim=-1).clamp(min=1.0)
+    return residual_norm.pow(2).sum(dim=-1) / n_voiced
+
+
+def interference_suppression_loss(s, s_hat, eps=1e-8, frame_len=1600):
+    """
+    残留干渉直接ペナルティ損失（有声マスク付き）。
 
     出力とターゲットの差（= 残留干渉）をターゲットのピークで正規化して最小化。
     SI-SNR ・ SDR が対数スケールの頭打ちで感度が下がる高 SNR 域でも
     線形スケールで干渉を押し込み続ける。
 
-    Args:
-        s (Tensor): 正解音声 (B, T)
-        s_hat (Tensor): 推定音声 (B, T)
-    Returns:
-        loss (Tensor): 残留干渉の正規化エネルギーの平均
+    ターゲットが無音の区間（partial overlap等）ではresidualをマスクし、
+    有声区間のみで損失を計算する。無音区間の干渉抑制は energy_consistency_loss に任せる。
     """
-    residual = s_hat - s                                          # 残留干渉 (B, T)
-    # ターゲットのピーク絶対値で正規化（無音区間のゼロ除算を回避）
-    target_peak = s.abs().amax(dim=-1, keepdim=True).clamp(min=eps)  # (B, 1)
-    residual_norm = residual / target_peak
-    return residual_norm.pow(2).mean()
+    return interference_suppression_loss_per_sample(s, s_hat, eps=eps, frame_len=frame_len).mean()
+
 
 def energy_consistency_loss(target, output, frame_len=1600, hop_len=800, threshold_db=-20, eps=1e-8):
     """
@@ -246,57 +257,49 @@ class SpeechDataset(Dataset):
         - target_path
     """
 
-    def __init__(self, csv_file, transform=None, enroll_crop_sec=5, sample_rate=16000, random_enroll_crop=False):
+    def __init__(self, csv_file, transform=None, enroll_crop_sec=5, sample_rate=16000,
+                 random_enroll_crop=False, preload_to_ram=False):
         self.metadata = pd.read_csv(csv_file)
         self.transform = transform
         self.enroll_crop_samples = enroll_crop_sec * sample_rate
         self.random_enroll_crop = random_enroll_crop
+        self.preload_to_ram = preload_to_ram
+        self.cache = {}
+        if preload_to_ram:
+            print(f"RAM preloading {len(self.metadata)} samples...", flush=True)
+            for i, row in tqdm(self.metadata.iterrows(), total=len(self.metadata),
+                               desc="RAM load", dynamic_ncols=True):
+                m, _ = load_audio(row["mixture_path"])
+                t, _ = load_audio(row["target_path"])
+                self.cache[i] = (m, t)
+            print("RAM preload complete.", flush=True)
 
     def __len__(self):
         return len(self.metadata)
 
-
     def __getitem__(self, idx):
         row = self.metadata.iloc[idx]
-        mixture, sr1 = load_audio(row["mixture_path"])
-        enrollment, sr2 = load_audio(row["enrollment_path"])
-        target, sr3 = load_audio(row["target_path"])
-
-        # 学習時はenrollmentのランダムな区間をクロップ→モデルをより汎用的に
-        if self.random_enroll_crop:
-            T = enrollment.shape[-1]
-            crop_len = min(self.enroll_crop_samples, T)
-            if T > crop_len:
-                start = torch.randint(0, T - crop_len + 1, (1,)).item()
-                enrollment = enrollment[..., start: start + crop_len]
-
-        if self.transform:
-            mixture = self.transform(mixture)
-            enrollment = self.transform(enrollment)
-            target = self.transform(target)
-        return mixture, enrollment, target, row["enrollment_path"]
+        if self.preload_to_ram:
+            mixture, target = self.cache[idx]
+        else:
+            mixture, _ = load_audio(row["mixture_path"])
+            target, _ = load_audio(row["target_path"])
+        return mixture, row["enrollment_path"], target
 
 
 # ========================================
 # 3. 検証 / テスト時用の評価関数
 # ========================================
 @torch.no_grad()
-def evaluate(model, dataloader, speaker_encoder, device, cache_dir):
+def evaluate(model, dataloader, cache_dir, device):
     """DevやTestでSI-SNRを計算する共通関数"""
     model.eval()
     total_loss = 0.0
-    for mixture, enrollment, target, enrollment_lengths, enrollment_paths in dataloader:
+    for mixture, target, enrollment_paths in tqdm(dataloader, desc="Dev", leave=False, dynamic_ncols=True):
         mixture = mixture.to(device)
         target = target.to(device)
 
-        speaker_embeddings = get_cached_speaker_embeddings(
-            speaker_encoder,
-            enrollment,
-            enrollment_lengths,
-            enrollment_paths,
-            cache_dir,
-            device,
-        )
+        speaker_embeddings = get_cached_speaker_embeddings(enrollment_paths, cache_dir, device)
         output = model(mixture, speaker_embeddings)
 
         output = output.squeeze(1)
@@ -325,9 +328,11 @@ def train_and_validate(args):
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=8,
         collate_fn=collate_speech_batch,
-        pin_memory=False,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
     # Devデータ（ハイパーパラメータ調整・性能検証用）
@@ -336,9 +341,11 @@ def train_and_validate(args):
         dev_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=8,
         collate_fn=collate_speech_batch,
-        pin_memory=False,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
     # ---------------------------
@@ -381,29 +388,46 @@ def train_and_validate(args):
         device,
     )
 
+    # ---------------------------
+    # Resume 処理
+    # ---------------------------
+    start_epoch = 0
+    best_dev_loss = float("inf")
+    patience_count = 0
+
+    resume_ckpt = os.path.join(args.checkpoint_dir, "checkpoint_latest.pt")
+    if args.resume and os.path.exists(resume_ckpt):
+        ckpt = torch.load(resume_ckpt, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        if ckpt.get("optimizer") is not None:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if ckpt.get("scheduler") is not None:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch    = ckpt["epoch"]          # 次に実行するエポック番号 (0-indexed)
+        best_dev_loss  = ckpt["best_dev_loss"]
+        patience_count = ckpt["patience_count"]
+        log(f"Resumed from {resume_ckpt} (epoch {start_epoch}, best_dev_loss={best_dev_loss:.4f})")
+    elif args.resume:
+        log(f"WARNING: --resume specified but {resume_ckpt} not found. Starting fresh.")
+
     # 学習開始
     model.train()
-    global_step = 0
+    global_step = start_epoch * len(train_loader)
 
-    best_dev_loss = float("inf")  # Devの最小損失を追跡
-    patience_count = 0            # Early Stopping用カウンタ
-
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         epoch_loss = 0.0
 
         # ---------------------------
         # (C) Trainエポック
         # ---------------------------
-        for batch_idx, (mixture, enrollment, target, enrollment_lengths, enrollment_paths) in enumerate(train_loader):
-            # mixture, enrollment, target は形状が (B, 1, T)
+        train_pbar = tqdm(enumerate(train_loader), total=len(train_loader),
+                          desc=f"Epoch {epoch+1}/{args.num_epochs}", dynamic_ncols=True)
+        _step_t0 = time.perf_counter()   # ステップ速度計測の起点
+        for batch_idx, (mixture, target, enrollment_paths) in train_pbar:
             mixture = mixture.to(device)
             target = target.to(device)
 
-            # enrollment 音声からスピーカーエンベディングを取得
             speaker_embeddings = get_cached_speaker_embeddings(
-                speaker_encoder,
-                enrollment,
-                enrollment_lengths,
                 enrollment_paths,
                 args.embedding_cache_dir,
                 device,
@@ -420,13 +444,13 @@ def train_and_validate(args):
             loss_sdr = sdr_loss(target, output)
             loss_spec = spectral_loss(target, output)
             loss_energy = energy_consistency_loss(target, output)
-            loss_interference = interference_suppression_loss(target, output)
+            loss_interference = 5.0 * interference_suppression_loss(target, output)
             # SI-SNR: 基本的な分離品質を安定気く学習
             # SDR:    スケール非不変、絶対的な残留干渉を直接ペナルティ
             # Spec:   高周波音質補完
             # Energy: 無音フレームでの干渉漏れ抱制
             # Interference: 線形スケールで干渉残留を押し込む
-            loss = loss_sisnr + loss_sdr + 0.1 * loss_spec + 0.1 * loss_energy + 5.0 * loss_interference
+            loss = loss_sisnr + loss_sdr + 0.1 * loss_spec + 0.1 * loss_energy + loss_interference
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
@@ -434,18 +458,35 @@ def train_and_validate(args):
             epoch_loss += loss.item()
             global_step += 1
 
+            # ステップ速度を計算して tqdm に表示
+            _elapsed = time.perf_counter() - _step_t0
+            _steps_done = batch_idx + 1  # 0-indexed なので +1
+            _sps = _steps_done / max(_elapsed, 1e-9)   # steps per second
+            _sec_per_step = 1.0 / _sps
+
+            train_pbar.set_postfix({
+                "loss": f"{loss.item():.3f}",
+                "SI-SNR": f"{loss_sisnr.item():.3f}",
+                "Interf": f"{loss_interference.item():.4f}",
+                "sps": f"{_sps:.2f}",
+            })
             if batch_idx % args.log_interval == 0:
                 log(f"[Train] Epoch {epoch+1}/{args.num_epochs}, "
                     f"Step {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f} "
                     f"(SI-SNR={loss_sisnr.item():.4f}, SDR={loss_sdr.item():.4f}, "
-                    f"Spec={loss_spec.item():.4f}, Energy={loss_energy.item():.4f}, Interf={loss_interference.item():.4f})")
+                    f"Spec={loss_spec.item():.4f}, Energy={loss_energy.item():.4f}, Interf={loss_interference.item():.4f}) "
+                    f"[{_sps:.2f} steps/s, {_sec_per_step:.2f} s/step]")
 
         avg_train_loss = epoch_loss / len(train_loader)
+        _epoch_elapsed = time.perf_counter() - _step_t0
+        log(f"[Train] Epoch {epoch+1} done: avg_loss={avg_train_loss:.4f}, "
+            f"elapsed={_epoch_elapsed:.1f}s, "
+            f"{len(train_loader)/_epoch_elapsed:.2f} steps/s")
 
         # ---------------------------
         # (D) Devエポック (検証)
         # ---------------------------
-        dev_loss = evaluate(model, dev_loader, speaker_encoder, device, args.embedding_cache_dir)
+        dev_loss = evaluate(model, dev_loader, args.embedding_cache_dir, device)
         log(f"[Dev]   Epoch {epoch+1}/{args.num_epochs}, Dev Loss: {dev_loss:.4f}")
 
         # スケジューラにDev損失を渡して学習率を調整（ReduceLROnPlateauなど）
@@ -454,8 +495,9 @@ def train_and_validate(args):
         # ---------------------------
         # (E) ベストモデルの更新 & 早期停止判定
         # ---------------------------
-        # 毎エポックのチェックポイントを保存
         os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+        # モデルのみのエポック別チェックポイント（推論用）
         epoch_ckpt_path = os.path.join(args.checkpoint_dir, f"epoch_{epoch+1:03d}.pth")
         torch.save(model.state_dict(), epoch_ckpt_path)
 
@@ -463,16 +505,33 @@ def train_and_validate(args):
             best_dev_loss = dev_loss
             patience_count = 0
 
-            # ベストモデルを保存（Dev損失が改善したとき）
             ckpt_path = os.path.join(args.checkpoint_dir, "best_model.pth")
             torch.save(model.state_dict(), ckpt_path)
             log(f"=> Best model updated! Dev Loss = {dev_loss:.4f}")
         else:
-            # 改善しなかった場合
             patience_count += 1
             if patience_count >= args.early_stop_patience:
                 log("Early stopping triggered.")
+                # フル checkpoint を保存してから終了
+                torch.save({
+                    "epoch": epoch + 1,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "best_dev_loss": best_dev_loss,
+                    "patience_count": patience_count,
+                }, os.path.join(args.checkpoint_dir, "checkpoint_latest.pt"))
                 break
+
+        # フル checkpoint（再開用）を毎エポック上書き保存
+        torch.save({
+            "epoch": epoch + 1,          # 次回はこのエポックから開始
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "best_dev_loss": best_dev_loss,
+            "patience_count": patience_count,
+        }, os.path.join(args.checkpoint_dir, "checkpoint_latest.pt"))
 
         log(f"[Train] Epoch {epoch+1} finished! Average Train Loss: {avg_train_loss:.4f}\n")
 
@@ -564,13 +623,21 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained_model", type=str, default=None,
                         help="Path to pretrained model .pth to fine-tune from (e.g. v4's best_model.pth). "
                              "New layers (temporal_gate) are randomly initialized.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from checkpoint_latest.pt in --checkpoint_dir.")
 
     args = parser.parse_args()
 
     _log_file = None
     if args.log_file:
         os.makedirs(os.path.dirname(args.log_file) if os.path.dirname(args.log_file) else ".", exist_ok=True)
-        _log_file = open(args.log_file, "w", encoding="utf-8", buffering=1)
+        # resume 時は追記モードでログを開く
+        log_open_mode = "a" if args.resume else "w"
+        _log_file = open(args.log_file, log_open_mode, encoding="utf-8", buffering=1)
+        if args.resume:
+            _log_file.write("\n" + "="*60 + "\n")
+            _log_file.write("[RESUMED]\n")
+            _log_file.write("="*60 + "\n")
 
     try:
         if args.mode == "train":
