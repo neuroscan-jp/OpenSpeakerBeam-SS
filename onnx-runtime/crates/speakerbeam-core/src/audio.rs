@@ -28,10 +28,18 @@ pub fn load_wav_mono_16k(path: &Path, cfg: &RuntimeConfig) -> Result<Vec<f32>, A
         SampleFormat::Float => reader
             .into_samples::<f32>()
             .collect::<Result<Vec<_>, _>>()?,
-        SampleFormat::Int => reader
-            .into_samples::<i32>()
-            .map(|s| s.map(|v| v as f32 / i32::MAX as f32))
-            .collect::<Result<Vec<_>, _>>()?,
+        SampleFormat::Int => {
+            let scale = match spec.bits_per_sample {
+                16 => i16::MAX as f32,
+                24 => 8_388_607f32,
+                32 => i32::MAX as f32,
+                bits => (1i64 << (bits.saturating_sub(1))) as f32,
+            };
+            reader
+                .into_samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / scale))
+                .collect::<Result<Vec<_>, _>>()?
+        }
     };
     if samples.is_empty() {
         return Err(AudioError::Empty);

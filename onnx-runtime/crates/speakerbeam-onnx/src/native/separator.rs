@@ -739,6 +739,7 @@ impl NativeSeparatorStream {
         ))
     }
 
+    #[cfg(test)]
     fn forward_conv_block(
         &self,
         block: usize,

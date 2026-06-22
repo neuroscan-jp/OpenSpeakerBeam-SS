@@ -1,3 +1,6 @@
+//! Elementwise / conv helpers for native SeparatorStream (alloc and in-place variants).
+#![allow(dead_code)]
+
 use matrixmultiply::sgemm;
 use rayon::prelude::*;
 

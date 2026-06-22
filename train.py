@@ -1,4 +1,5 @@
 import os
+import random
 import sys
 import time
 import hashlib
@@ -13,6 +14,7 @@ from torch.nn.utils.rnn import pad_sequence
 import pandas as pd
 from tqdm import tqdm
 from model import SpeakerBeamSS
+from model.streaming import swap_gln_to_cgln
 from tools import get_speaker_embedding, load_ecapa_model
 
 _log_file = None
@@ -50,6 +52,32 @@ def collate_speech_batch(batch):
     )
 
 
+def apply_prefix_crop_batch(
+    mixture: torch.Tensor,
+    target: torch.Tensor,
+    min_sec: float,
+    prob: float,
+    sample_rate: int = 16000,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Randomly crop utterances to a prefix (simulates early streaming segments for cgLN)."""
+    if min_sec <= 0 or prob <= 0:
+        return mixture, target
+    min_len = int(min_sec * sample_rate)
+    mixes, targets = [], []
+    for b in range(mixture.shape[0]):
+        m = mixture[b, 0]
+        t = target[b, 0]
+        length = m.shape[-1]
+        if random.random() < prob and length > min_len:
+            end = random.randint(min_len, length)
+            m, t = m[:end], t[:end]
+        mixes.append(m)
+        targets.append(t)
+    mix_pad = pad_sequence(mixes, batch_first=True).unsqueeze(1)
+    tgt_pad = pad_sequence(targets, batch_first=True).unsqueeze(1)
+    return mix_pad, tgt_pad
+
+
 def get_cached_speaker_embeddings(enrollment_paths, cache_dir, device, expected_dim=192):
     """キャッシュ済み埋め込みをロードして返す（事前計算済み前提）。"""
     embeddings = []
@@ -82,11 +110,9 @@ def precompute_all_embeddings(csv_files, cache_dir, speaker_encoder, device, exp
             cache_key = hashlib.sha1(os.path.normpath(enrollment_path).encode("utf-8")).hexdigest()
             cache_path = os.path.join(cache_dir, f"{cache_key}.npy")
 
-            # 既存キャッシュの次元チェック（不一致なら再計算して上書き）
+            # 既存キャッシュがあればスキップ（次元不一致は学習中の load で検出）
             if os.path.exists(cache_path):
-                cached = np.load(cache_path)
-                if cached.shape[-1] == expected_dim:
-                    continue
+                continue
 
             try:
                 waveform, _ = load_audio(enrollment_path)
@@ -164,6 +190,17 @@ def sdr_loss(s, s_hat, eps=1e-8):
     distortion_energy = (distortion ** 2).sum(dim=-1)
     sdr = 10 * torch.log10(target_energy / (distortion_energy + eps) + eps)
     return -sdr.mean()
+
+
+def head_rms_loss(s, s_hat, head_samples: int, eps: float = 1e-8) -> torch.Tensor:
+    """Penalize when the output head is quieter than the target (DPDFNet survivability)."""
+    if head_samples <= 0 or s.shape[-1] < head_samples:
+        return torch.tensor(0.0, device=s.device)
+    sh = s[:, :head_samples]
+    oh = s_hat[:, :head_samples]
+    rms_t = torch.sqrt(torch.mean(sh**2, dim=-1) + eps)
+    rms_o = torch.sqrt(torch.mean(oh**2, dim=-1) + eps)
+    return torch.mean(torch.relu(rms_t - rms_o) ** 2)
 
 
 def _voiced_mask(s, frame_len=1600, eps=1e-8):
@@ -376,6 +413,10 @@ def train_and_validate(args):
         if skipped:
             log(f"  Skipped (shape mismatch / new): {skipped}")
 
+    if args.use_cgln:
+        swap_gln_to_cgln(model)
+        log("Swapped GlobLN -> CumLN (cgLN streaming training path)")
+
     # 音声埋め込みエンコーダー (ECAPA-TDNN)
     # torch._dynamo 初期化後にロードすることで speechbrain との衝突を回避
     speaker_encoder = load_ecapa_model(device)
@@ -426,6 +467,13 @@ def train_and_validate(args):
         for batch_idx, (mixture, target, enrollment_paths) in train_pbar:
             mixture = mixture.to(device)
             target = target.to(device)
+            if args.use_cgln and args.prefix_crop_min_sec > 0:
+                mixture, target = apply_prefix_crop_batch(
+                    mixture,
+                    target,
+                    args.prefix_crop_min_sec,
+                    args.prefix_crop_prob,
+                )
 
             speaker_embeddings = get_cached_speaker_embeddings(
                 enrollment_paths,
@@ -444,13 +492,23 @@ def train_and_validate(args):
             loss_sdr = sdr_loss(target, output)
             loss_spec = spectral_loss(target, output)
             loss_energy = energy_consistency_loss(target, output)
-            loss_interference = 5.0 * interference_suppression_loss(target, output)
-            # SI-SNR: 基本的な分離品質を安定気く学習
-            # SDR:    スケール非不変、絶対的な残留干渉を直接ペナルティ
-            # Spec:   高周波音質補完
-            # Energy: 無音フレームでの干渉漏れ抱制
-            # Interference: 線形スケールで干渉残留を押し込む
+            loss_interference = args.interference_weight * interference_suppression_loss(
+                target, output
+            )
             loss = loss_sisnr + loss_sdr + 0.1 * loss_spec + 0.1 * loss_energy + loss_interference
+
+            loss_head_sisnr = torch.tensor(0.0, device=device)
+            loss_head_sdr = torch.tensor(0.0, device=device)
+            loss_head_rms = torch.tensor(0.0, device=device)
+            head_samples = int(args.head_loss_sec * 16000) if args.head_loss_sec > 0 else 0
+            if head_samples > 0 and target.shape[-1] >= head_samples:
+                th, oh = target[:, :head_samples], output[:, :head_samples]
+                loss_head_sisnr = si_snr_loss(th, oh)
+                loss_head_sdr = sdr_loss(th, oh)
+                loss = loss + args.head_loss_weight * (loss_head_sisnr + loss_head_sdr)
+                if args.head_rms_loss_weight > 0:
+                    loss_head_rms = head_rms_loss(target, output, head_samples)
+                    loss = loss + args.head_rms_loss_weight * loss_head_rms
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
@@ -474,6 +532,7 @@ def train_and_validate(args):
                 log(f"[Train] Epoch {epoch+1}/{args.num_epochs}, "
                     f"Step {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f} "
                     f"(SI-SNR={loss_sisnr.item():.4f}, SDR={loss_sdr.item():.4f}, "
+                    f"Head={loss_head_sisnr.item():.4f}, HeadRMS={loss_head_rms.item():.4f}, "
                     f"Spec={loss_spec.item():.4f}, Energy={loss_energy.item():.4f}, Interf={loss_interference.item():.4f}) "
                     f"[{_sps:.2f} steps/s, {_sec_per_step:.2f} s/step]")
 
@@ -625,6 +684,47 @@ if __name__ == "__main__":
                              "New layers (temporal_gate) are randomly initialized.")
     parser.add_argument("--resume", action="store_true",
                         help="Resume training from checkpoint_latest.pt in --checkpoint_dir.")
+    parser.add_argument(
+        "--use_cgln",
+        action="store_true",
+        help="Train with CumLN (cgLN) instead of GlobLN for streaming-compatible inference.",
+    )
+    parser.add_argument(
+        "--prefix_crop_min_sec",
+        type=float,
+        default=2.0,
+        help="With --use_cgln: minimum random prefix length (seconds) for streaming simulation.",
+    )
+    parser.add_argument(
+        "--prefix_crop_prob",
+        type=float,
+        default=0.5,
+        help="With --use_cgln: probability of prefix cropping each training sample.",
+    )
+    parser.add_argument(
+        "--head_loss_sec",
+        type=float,
+        default=0.0,
+        help="Extra SI-SNR+SDR loss on the first N seconds (0=disabled).",
+    )
+    parser.add_argument(
+        "--head_loss_weight",
+        type=float,
+        default=4.0,
+        help="Weight for head SI-SNR+SDR when --head_loss_sec > 0.",
+    )
+    parser.add_argument(
+        "--head_rms_loss_weight",
+        type=float,
+        default=0.0,
+        help="Weight for head RMS match loss (output not quieter than target).",
+    )
+    parser.add_argument(
+        "--interference_weight",
+        type=float,
+        default=5.0,
+        help="Multiplier for interference suppression loss.",
+    )
 
     args = parser.parse_args()
 

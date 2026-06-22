@@ -12,7 +12,6 @@ use speakerbeam_core::embedding::{
 use speakerbeam_core::RuntimeConfig;
 use speakerbeam_onnx::{
     EcapaSession, IncrementalStreamingSession, SpeakerBeamSession, StreamingSession, EMBED_DIM,
-    FIXED_SAMPLES,
 };
 use tracing::info;
 
@@ -254,9 +253,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let model_path = resolve_path(&cwd, &args.model);
         info!("loading ONNX model: {}", model_path.display());
         let mut session = SpeakerBeamSession::from_file(&model_path, args.threads)?;
-        let mixture_fixed = fit_fixed_length(&mixture, FIXED_SAMPLES);
-        info!("running offline inference (fixed {} samples)", FIXED_SAMPLES);
-        let enhanced = session.run(&mixture_fixed, &embedding)?;
+        let fixed = session.fixed_samples();
+        let orig_len = mixture.len();
+        let mixture_fixed = fit_fixed_length(&mixture, fixed);
+        info!("running offline inference (fixed {} samples)", fixed);
+        let enhanced_full = session.run(&mixture_fixed, &embedding)?;
+        let out_len = orig_len.min(enhanced_full.len());
+        let enhanced = enhanced_full[..out_len].to_vec();
         save_wav_mono_16k(&args.output, &enhanced, cfg.sample_rate)?;
     }
 

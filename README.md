@@ -94,6 +94,19 @@ FLOPs: 21.60G, Params: 7.64M
 - Expected to run **in real-time on modern CPUs** with **AVX2 or AVX-512** optimizations.
 - **Neon acceleration** planned for **iOS devices** via ONNX Runtime.
 
+### 🎵 BGM-augmented training data
+
+Add procedurally generated background-music-like interference to existing triples.
+See [`docs/bgm_training_data.md`](docs/bgm_training_data.md).
+
+```sh
+python create_bgm_mixture_data.py \
+  --train_csv data_csv/train/metadata.csv \
+  --num_samples 5000 \
+  --zone_num_samples 1000 \
+  --out_csv data_csv/train/metadata_bgm.csv
+```
+
 ## 📌 TODO
 
 - Validate output quality

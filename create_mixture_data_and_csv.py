@@ -167,6 +167,15 @@ def mix_signals(target: np.ndarray, interference: np.ndarray, noise: np.ndarray,
     return mixture
 
 
+def mix_speech_only(target: np.ndarray, interference: np.ndarray, sir_db: float) -> np.ndarray:
+    """target + scaled interferer only (no additive noise)."""
+    power_target = np.mean(target ** 2)
+    power_interference = np.mean(interference ** 2)
+    target_interference_power = power_target / (10 ** (sir_db / 10))
+    scale = np.sqrt(target_interference_power / (power_interference + 1e-8))
+    return target + interference * scale
+
+
 def get_all_flac_files(librispeech_root: str) -> dict:
     """
     LibriSpeech のルートディレクトリ（例：data/train/LibriSpeech/clean）を走査して、

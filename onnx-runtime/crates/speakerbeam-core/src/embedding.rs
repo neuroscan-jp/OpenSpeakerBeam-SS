@@ -42,7 +42,9 @@ pub fn load_embedding_npy(path: &Path, expected_dim: usize) -> Result<Vec<f32>, 
     if flat.len() != expected_dim {
         return Err(EmbeddingError::InvalidLength(flat.len(), expected_dim));
     }
-    Ok(flat.to_vec())
+    let mut vec = flat.to_vec();
+    crate::embedding::normalize_l2(&mut vec);
+    Ok(vec)
 }
 
 /// Segment start indices for multi-segment enrollment (matches inference.py).
