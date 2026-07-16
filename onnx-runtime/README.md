@@ -22,7 +22,7 @@ onnx-runtime/
 │   ├── speakerbeam-onnx/  # ONNX Session ラッパー
 │   └── speakerbeam-cli/   # CLI バイナリ
 ├── export/                # PyTorch → ONNX 変換（Python）
-├── models/                # 配置する .onnx 重み（git 管理外推奨）
+├── models/                # 推論用重み（encoder/decoder/ecapa/streaming_separator は git 管理）
 └── tests/                 # Python との数値一致テスト
 ```
 

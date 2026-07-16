@@ -23,5 +23,8 @@ pretrained_models/
 # Rust ONNX runtime
 onnx-runtime/target/
 onnx-runtime/models/*.onnx
+!onnx-runtime/models/encoder_frame.onnx
+!onnx-runtime/models/decoder.onnx
+!onnx-runtime/models/ecapa_embedding.onnx
 onnx-runtime/models/*.onnx.data
 
